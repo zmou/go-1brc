@@ -1,8 +1,8 @@
 package main
 
 import (
-    "bufio"
     "bytes"
+    "errors"
     "flag"
     "fmt"
     "io"
@@ -12,19 +12,23 @@ import (
     "runtime/pprof"
     "runtime/trace"
     "sort"
+    "strconv"
     "strings"
     "sync"
     "time"
 )
 
-var measurementsFile = flag.String("measurements", "", "path to the measurements file")
-var resultChan = make(chan map[string]*cityTemp, 10000)
-var workerChan = make(chan []string, 1000)
-var byteChan = make(chan []byte, 200)
-var workerWg sync.WaitGroup
-var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
-var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
-var traceprofile = flag.String("traceprofile", "", "write tarce execution to `file`")
+var (
+    measurementsFile = flag.String("measurements", "", "path to the measurements file")
+    cpuprofile       = flag.String("cpuprofile", "", "write cpu profile to `file`")
+    memprofile       = flag.String("memprofile", "", "write memory profile to `file`")
+    traceprofile     = flag.String("traceprofile", "", "write tarce execution to `file`")
+    numprocs         = flag.String("numprocs", "", "the number of processes to start")
+
+    resultChan = make(chan map[string]*cityTemp, 100)
+    workerChan = make(chan []byte, 100)
+    workerWg   sync.WaitGroup
+)
 
 func main() {
     flag.Parse()
@@ -53,17 +57,16 @@ func main() {
         defer func(f *os.File) {
             _ = f.Close()
         }(f)
-        if err := pprof.StartCPUProfile(f); err != nil {
+        if err = pprof.StartCPUProfile(f); err != nil {
             log.Fatal("could not start CPU profile: ", err)
         }
         defer pprof.StopCPUProfile()
     }
 
     startTime := time.Now()
-    collect := process(*measurementsFile)
-
-    fmt.Println(collect)
-    fmt.Println("Elapsed Time:", time.Since(startTime))
+    execute(*measurementsFile)
+    endTime := time.Now()
+    fmt.Println("Elapsed Time:", endTime.Sub(startTime))
 
     if *memprofile != "" {
         f, err := os.Create("./profiles/" + *memprofile)
@@ -74,40 +77,27 @@ func main() {
             _ = f.Close()
         }(f)
         runtime.GC()
-        if err := pprof.WriteHeapProfile(f); err != nil {
+        if err = pprof.WriteHeapProfile(f); err != nil {
             log.Fatal("could not write memory profile: ", err)
         }
     }
 }
 
-func process(filename string) string {
-    // make process jobs worker
+func execute(filename string) {
+    // make execute jobs worker
     makeWorker()
 
     // read measurements file
-    go readFile2(filename)
+    go processFile(filename)
 
     results := processResult()
-    collect := make([]collectResult, 0, len(results))
-    for city, v := range results {
-        collect = append(collect, collectResult{
-            city: city,
-            min:  float64(v.min) / 10,
-            max:  float64(v.max) / 10,
-            avg:  float64(v.sum) / float64(v.count) / 10,
-        })
-    }
-
-    sort.SliceStable(collect, func(i, j int) bool {
-        return collect[i].city < collect[j].city
-    })
 
     var stringsBuilder strings.Builder
-    for _, i := range collect {
+    for _, i := range results {
         stringsBuilder.WriteString(fmt.Sprintf("%s=%.1f/%.1f/%.1f, ", i.city, i.min, i.avg, i.max))
     }
 
-    return stringsBuilder.String()
+    fmt.Printf("{%s}\n", stringsBuilder.String())
 }
 
 type cityTemp struct {
@@ -125,7 +115,14 @@ type collectResult struct {
 }
 
 func makeWorker() {
-    num := runtime.NumCPU()
+    var num int
+    if *numprocs != "" {
+        num, _ = strconv.Atoi(*numprocs)
+    }
+    if num < 1 {
+        num = runtime.NumCPU()
+    }
+    fmt.Printf("Starting workers:%d\n", num)
     for i := 0; i < num; i++ {
         workerWg.Add(1)
         go worker()
@@ -135,7 +132,7 @@ func makeWorker() {
 func worker() {
     defer workerWg.Done()
     for {
-        data, ok := <-byteChan
+        data, ok := <-workerChan
         if !ok {
             break
         }
@@ -144,70 +141,7 @@ func worker() {
     }
 }
 
-func resolveLine(line string) (string, int64) {
-    end := len(line)
-    tenths := int32(line[end-1] - '0')
-    ones := int32(line[end-3] - '0') // line[end-2] is '.'
-    var temp int32
-    var semicolon int
-    if line[end-4] == ';' { // positive N.N temperature
-        temp = ones*10 + tenths
-        semicolon = end - 4
-    } else if line[end-4] == '-' { // negative -N.N temperature
-        temp = -(ones*10 + tenths)
-        semicolon = end - 5
-    } else {
-        tens := int32(line[end-4] - '0')
-        if line[end-5] == ';' { // positive NN.N temperature
-            temp = tens*100 + ones*10 + tenths
-            semicolon = end - 5
-        } else { // negative -NN.N temperature
-            temp = -(tens*100 + ones*10 + tenths)
-            semicolon = end - 6
-        }
-    }
-    station := line[:semicolon]
-
-    return station, int64(temp)
-}
-
-func readFile(filename string) {
-    file, err := os.Open(filename)
-    if err != nil {
-        panic(err)
-    }
-    defer func(file *os.File) {
-        _ = file.Close()
-    }(file)
-
-    buf := make([]byte, 64*1024*1024)
-    scanner := bufio.NewScanner(file)
-    scanner.Buffer(buf, 64*1024*1024)
-    chunkSize := 512 * 1024
-    chunkStream := make([]string, 0, chunkSize)
-    i := 0
-    for scanner.Scan() {
-        line := scanner.Text()
-        i++
-        if i >= chunkSize {
-            workerChan <- chunkStream
-            chunkStream = chunkStream[:0]
-            i = 0
-        } else {
-            chunkStream = append(chunkStream, line)
-        }
-    }
-    if len(chunkStream) > 0 {
-        workerChan <- chunkStream
-    }
-
-    close(workerChan)
-    workerWg.Wait()
-
-    close(resultChan)
-}
-
-func readFile2(filename string) {
+func processFile(filename string) {
     file, err := os.Open(filename)
     if err != nil {
         panic(err)
@@ -219,63 +153,100 @@ func readFile2(filename string) {
     bufSize := 64 * 1024 * 1024 // 64MB
     buf := make([]byte, bufSize)
     leftover := make([]byte, 0, bufSize)
-
     for {
         n, e := file.Read(buf)
-        if n == 0 {
-            break
-        }
         if e != nil {
-            if err == io.EOF {
+            if errors.Is(e, io.EOF) {
                 break
             }
             panic(e)
+        }
+        if n == 0 {
+            break
         }
         buf = buf[:n]
 
         lastNewLineIndex := bytes.LastIndex(buf, []byte("\n"))
 
-        toSend := make([]byte, 0, len(leftover)+lastNewLineIndex+1)
-        toSend = append(toSend, leftover...)
-        toSend = append(toSend, buf[:lastNewLineIndex+1]...)
+        toSend := make([]byte, len(leftover)+lastNewLineIndex+1)
+        copy(toSend, leftover)
+        copy(toSend[len(leftover):], buf[:lastNewLineIndex+1])
 
         // 将本次读取的数据最后一个 \n 后的数据赋值给 leftover，以备下一轮使用
         leftover = append(leftover[:0], buf[lastNewLineIndex+1:]...)
 
-        byteChan <- toSend
+        workerChan <- toSend
     }
 
-    close(byteChan)
+    close(workerChan)
     workerWg.Wait()
 
     close(resultChan)
 }
 
+func resolveLine(line []byte) ([]byte, int64) {
+    end := len(line)
+    if line[end-1] == '\r' {
+        end -= 1
+    }
+
+    var temp int64
+    var semi int
+    var tens int64
+    minus := false
+    tenths := int64(line[end-1] - '0')
+    ones := int64(line[end-3] - '0')
+
+    i := end - 4
+    for ; i > 0; i-- {
+        if line[i] == ';' {
+            semi = i
+            break
+        } else if line[i] == '-' {
+            minus = true
+            semi = i - 1
+            break
+        } else {
+            tens = int64(line[i] - '0')
+        }
+    }
+
+    temp = tens*100 + ones*10 + tenths
+    if minus {
+        temp = -temp
+    }
+
+    return line[:semi], temp
+}
+
 func processChunk(chunk []byte) map[string]*cityTemp {
-    chunkStr := string(chunk)
-    var start int
+    var offset int
     tmpStats := make(map[string]*cityTemp)
-
-    for i := 0; i < len(chunkStr); i++ {
-        switch chunkStr[i] {
+    hash := newHash()
+    for i := 0; i < len(chunk); i++ {
+        switch chunk[i] {
         case '\n':
-            line := chunkStr[start:i]
-            end := len(line)
-            if line[end-1] == '\r' {
-                line = line[:end-1]
-            }
+            line := chunk[offset:i]
+            offset = i + 1
             city, temp := resolveLine(line)
-            start = i + 1
 
-            stat, exists := tmpStats[city]
-            if !exists {
-                tmpStats[city] = &cityTemp{
-                    min:   temp,
-                    max:   temp,
-                    sum:   temp,
-                    count: 1,
+            hashIndex := hash.hashIndex(city)
+            hitem := hash.items[hashIndex]
+            if hitem.key == nil {
+                key := make([]byte, len(city))
+                copy(key, city)
+                hash.items[hashIndex] = hashitem{
+                    key: key,
+                    val: &cityTemp{
+                        min:   temp,
+                        max:   temp,
+                        sum:   temp,
+                        count: 1,
+                    },
                 }
-            } else {
+                hash.len++
+            } else if bytes.Equal(hitem.key, city) {
+                stat := hitem.val
                 stat.count++
                 stat.sum += temp
                 if temp > stat.max {
@@ -285,13 +256,24 @@ func processChunk(chunk []byte) map[string]*cityTemp {
                     stat.min = temp
                 }
             }
+
+            if hash.len > len(hash.items)/2 {
+                panic("too many items in hash table")
+            }
         }
+    }
+
+    for _, v := range hash.items {
+        if v.key == nil {
+            continue
+        }
+        tmpStats[string(v.key)] = v.val
     }
 
     return tmpStats
 }
 
-func processResult() map[string]*cityTemp {
+func processResult() []collectResult {
     var resultTemp = make(map[string]*cityTemp)
 
     for t := range resultChan {
@@ -311,5 +293,56 @@ func processResult() map[string]*cityTemp {
         }
     }
 
-    return resultTemp
+    collect := make([]collectResult, 0, len(resultTemp))
+    for city, v := range resultTemp {
+        collect = append(collect, collectResult{
+            city: city,
+            min:  float64(v.min) / 10,
+            max:  float64(v.max) / 10,
+            avg:  float64(v.sum) / float64(v.count) / 10,
+        })
+    }
+
+    sort.SliceStable(collect, func(i, j int) bool {
+        return collect[i].city < collect[j].city
+    })
+
+    return collect
+}
+
+type hashx struct {
+    len   int
+    items [100000]hashitem
+}
+
+type hashitem struct {
+    key []byte
+    val *cityTemp
+}
+
+func newHash() *hashx {
+    return new(hashx)
+}
+
+const (
+    // offset64 FNVa offset basis. See https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function#FNV-1a_hash
+    offset64 = 14695981039346656037
+    // prime64 FNVa prime value. See https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function#FNV-1a_hash
+    prime64 = 1099511628211
+)
+
+func (h *hashx) Sum64(key []byte) uint64 {
+    var hash uint64 = offset64
+    for i := 0; i < len(key); i++ {
+        hash ^= uint64(key[i])
+        hash *= prime64
+    }
+
+    return hash
+}
+
+func (h *hashx) hashIndex(key []byte) int {
+    hashedKey := h.Sum64(key)
+    hashIndex := int(hashedKey & uint64(len(h.items)-1))
+    return hashIndex
 }
